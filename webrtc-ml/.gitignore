@@ -1,0 +1,8 @@
+engtrackervenv/
+meeting_reports/
+__pycache__/
+test_audio/
+data/
+node_modules/
+webrtc-ml2.zip
+.DS_Store

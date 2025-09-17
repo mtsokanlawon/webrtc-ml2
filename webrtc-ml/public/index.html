@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebRTC Meeting</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <h1>🖥️ WebRTC Meeting</h1>
+    <div class="status-bar">
+      Status: <span id="connectionStatus">disconnected</span> | Participants: <span id="peerCount">0</span>
+    </div>
+  </header>
+
+  <section class="controls">
+    <input type="text" id="peerName" placeholder="Your Name">
+    <input type="text" id="roomId" placeholder="Room ID" value="demo-room">
+    <button id="joinBtn">Join Meeting</button>
+    <button id="leaveBtn" disabled>Leave Meeting</button>
+    <button id="finalizeBtn" style="display:none;">Download Summary</button>
+  </section>
+
+  <section class="videos">
+    <div class="video-container">
+      <h3>Your Video</h3>
+      <video id="localVideo" autoplay playsinline muted></video>
+    </div>
+    <div id="remoteVideos" class="remote-videos"></div>
+  </section>
+
+  <section class="log-section">
+    <h3>Log</h3>
+    <pre id="log"></pre>
+    <div id="reportLinks"></div>
+  </section>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
