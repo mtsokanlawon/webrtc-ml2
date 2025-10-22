@@ -28,9 +28,65 @@ function updateStatus(status) {
   if (statusEl) statusEl.textContent = status.charAt(0).toUpperCase() + status.slice(1);
 }
 
+// ===== Audio upload queue (NEW) =====
+let audioUploadQueue = [];
+let audioUploading = false;
+const AUDIO_QUEUE_MAX = 12; // cap to avoid unbounded memory growth
+
+function enqueueAudioChunk(fd) {
+  if (audioUploadQueue.length >= AUDIO_QUEUE_MAX) {
+    console.warn("⚠️ Audio queue full — dropping oldest chunk");
+    audioUploadQueue.shift();
+  }
+  audioUploadQueue.push(fd);
+  processAudioQueue();
+}
+
+async function processAudioQueue() {
+  if (audioUploading) return;
+  audioUploading = true;
+  while (audioUploadQueue.length > 0) {
+    const fd = audioUploadQueue[0];
+    try {
+      const resp = await fetch('/ingest/audio', { method: 'POST', body: fd });
+      if (!resp.ok) {
+        log(`❌ Audio upload failed: ${resp.status} ${resp.statusText}`);
+        // on server error drop and continue to avoid infinite loops
+      } else {
+        // log success (try to show file size if possible)
+        try {
+          const f = fd.get('file');
+          const size = f && f.size ? f.size : 'unknown';
+          log(`🎤 Uploaded audio chunk (${size} bytes)`);
+        } catch (e) {
+          log('🎤 Uploaded audio chunk');
+        }
+      }
+      audioUploadQueue.shift();
+    } catch (err) {
+      log(`❌ Audio upload error: ${err.message}. Retrying in 500ms`);
+      // exponential backoff could be added; for now simple wait then retry
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+  audioUploading = false;
+}
+
+async function flushAudioQueue(timeoutMs = 3000) {
+  const start = Date.now();
+  while (audioUploadQueue.length > 0 && (Date.now() - start) < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (audioUploadQueue.length > 0) {
+    console.warn("⚠️ flushAudioQueue timed out, dropping remaining chunks");
+    audioUploadQueue = [];
+  }
+}
+
 // ===== Socket.IO
 function initSocket() {
-  socket = io();
+  // ensure websockets are used (avoid long-polling fallbacks that add delay)
+  socket = io(window.location.origin, { transports: ["websocket"] });
 
   socket.on('connect', () => { log('🔌 Connected'); updateStatus('connected'); });
   socket.on('disconnect', () => { log('❌ Disconnected'); updateStatus('disconnected'); });
@@ -106,12 +162,43 @@ function initSocket() {
     }
   });
 
-  socket.on('transcription-event', ({ transcripts}) => {
-    // All users see transcription events
-    log(`⚠️ Transcription: ${transcripts}`);
-    showTranscriptBanner(`${transcripts}`);
+  // socket.on('transcription-event', ({ transcripts}) => {
+  //   // All users see transcription events
+  //   log(`⚠️ Transcription: ${transcripts}`);
+  //   showTranscriptBanner(`${transcripts}`);
+  // });
+
+  socket.on('transcription-event', ({ transcripts }) => {
+    // backward-compat fallback: sometimes server sends batch arrays
+    if (Array.isArray(transcripts)) {
+      // append only latest item to the UI to avoid large concatenations
+      const last = transcripts[transcripts.length - 1];
+      if (last) {
+        const short = `[${last.timestamp || last.timestamp_iso}] (${last.peerId || 'Unknown'}): ${last.text}`;
+        log(`⚠️ Transcription: ${short}`);
+        showTranscriptBanner(short);
+      }
+    } else {
+      log(`⚠️ Transcription: ${transcripts}`);
+      showTranscriptBanner(`${transcripts}`);
+    }
   });
 
+  // handle single-transcript emits (lightweight)
+  socket.on('transcript', (t) => {
+    // t is { roomId, peerId, text, final, timestamp, timestamp_iso }
+    try {
+      const short = `[${t.timestamp || t.timestamp_iso}] (${t.peerId||'Unknown'}): ${t.text}`;
+      // minimal work: log and render banner quickly
+      log(`🔉 ${short}`);
+      // schedule UI update on next frame
+      requestAnimationFrame(() => showTranscriptBanner(short));
+    } catch (e) {
+      console.error('❌ transcript handler error', e);
+    }
+  });
+
+  socket.onAny((ev, ...args) => console.log('[socket event]', ev, args));
   socket.on('error', err => log('Socket error: ' + JSON.stringify(err)));
 }
 
@@ -169,10 +256,10 @@ function showTranscriptBanner(msg) {
     banner = document.createElement('div');
     banner.id = 'transcriptBanner';
     banner.style.position = 'fixed';
-    banner.style.bottom = '10px';       // 👈 put it at the bottom instead of top
+    banner.style.bottom = '10px';
     banner.style.left = '50%';
     banner.style.transform = 'translateX(-50%)';
-    banner.style.background = '#2196f3'; // blue for transcripts
+    banner.style.background = '#2196f3';
     banner.style.color = '#fff';
     banner.style.padding = '10px 24px';
     banner.style.borderRadius = '8px';
@@ -182,9 +269,11 @@ function showTranscriptBanner(msg) {
     banner.style.zIndex = 9999;
     document.body.appendChild(banner);
   }
-  banner.textContent = msg;
+  // use innerText (fast) and avoid recreating DOM nodes repeatedly
+  banner.innerText = msg;
   banner.style.display = 'block';
-  setTimeout(() => { banner.style.display = 'none'; }, 6000); // show a bit longer than engagement
+  // shorter display so UI cycles faster
+  setTimeout(() => { banner.style.display = 'none'; }, 3000);
 }
 
 
@@ -233,7 +322,7 @@ function startAudioRecording() {
 
   audioRecorder.ondataavailable = async (e) => {
     console.log("Audio chunk available:", e.data.size);
-    
+
     if (e.data && e.data.size > 0) {
       const blob = e.data;
       const fd = new FormData();
@@ -242,12 +331,8 @@ function startAudioRecording() {
       fd.append('timestamp', Date.now());
       fd.append('file', blob, `audio_${peerId}_${Date.now()}.webm`);
 
-      try {
-        await fetch('/ingest/audio', { method: 'POST', body: fd });
-        log(`🎤 Sent audio chunk (${blob.size} bytes)`);
-      } catch (err) {
-        log(`❌ Audio upload failed: ${err.message}`);
-      }
+      // enqueue instead of sending immediately; queue worker will await responses
+      enqueueAudioChunk(fd);
     }
   };
 
@@ -256,23 +341,10 @@ function startAudioRecording() {
   log('🎙️ Local audio recording started (chunked)');
 }
 
-// function startAudioRecording() {
-//   audioRecorder = new MediaRecorder(localStream,{mimeType:'audio/webm;codecs=opus'});
-//   audioChunks = [];
-//   audioRecorder.ondataavailable = e=>{ if(e.data.size>0) audioChunks.push(e.data); };
-//   audioRecorder.onstop = async ()=>{
-//     if(audioChunks.length>0){
-//       const blob = new Blob(audioChunks,{type:'audio/webm;codecs=opus'});
-//       const fd = new FormData();
-//       fd.append('roomId', roomId); fd.append('peerId', peerId); fd.append('timestamp', Date.now()); fd.append('file', blob, `audio_${peerId}_${Date.now()}.webm`);
-//       await fetch('/ingest/audio',{method:'POST',body:fd});
-//       audioChunks=[];
-//     }
-//   };
-//   audioRecorder.start();
-// }
-
-function stopAudioRecording(){ if(audioRecorder&&audioRecorder.state!=='inactive') audioRecorder.stop(); audioRecorder=null; }
+function stopAudioRecording(){ 
+  if(audioRecorder && audioRecorder.state !== 'inactive') audioRecorder.stop();
+  audioRecorder = null; 
+}
 
 // ===== Remote audio recording
 function startRemoteAudioRecording(id, track) {
@@ -290,12 +362,9 @@ function startRemoteAudioRecording(id, track) {
       fd.append('timestamp', Date.now());
       fd.append('file', blob, `audio_${id}_${Date.now()}.webm`);
 
-      try {
-        await fetch('/ingest/audio', { method: 'POST', body: fd });
-        log(`🎤 Sent remote audio chunk from ${id} (${blob.size} bytes)`);
-      } catch (err) {
-        log(`❌ Remote audio upload failed: ${err.message}`);
-      }
+      // enqueue remote chunk as well
+      enqueueAudioChunk(fd);
+      log(`🎤 Enqueued remote audio chunk from ${id} (${blob.size} bytes)`);
     }
   };
 
@@ -303,25 +372,6 @@ function startRemoteAudioRecording(id, track) {
   remoteAudioRecorders[id] = { recorder };
   log(`🎙️ Remote audio recording started for ${id}`);
 }
-
-// function startRemoteAudioRecording(id, track){
-//   if(remoteAudioRecorders[id]) return;
-//   const recStream = new MediaStream([track]);
-//   const recorder = new MediaRecorder(recStream,{mimeType:'audio/webm;codecs=opus'});
-//   const chunks=[];
-//   recorder.ondataavailable=e=>{if(e.data.size>0) chunks.push(e.data)};
-//   recorder.onstop=async ()=>{
-//     if(chunks.length>0){
-//       const blob=new Blob(chunks,{type:'audio/webm;codecs=opus'});
-//       const fd=new FormData();
-//       fd.append('roomId', roomId); fd.append('peerId', id); fd.append('timestamp', Date.now()); fd.append('file', blob, `audio_${id}_${Date.now()}.webm`);
-//       await fetch('/ingest/audio',{method:'POST',body:fd});
-//     }
-//     delete remoteAudioRecorders[id];
-//   };
-//   recorder.start();
-//   remoteAudioRecorders[id]={recorder};
-// }
 
 // ===== WebRTC
 async function createPeerConnection(remoteId){
@@ -440,7 +490,12 @@ async function joinRoom(){
   if (!await initLocalMedia()) return;
 
   initSocket();
-  socket.emit('join', { roomId, peerId, isHost });
+  // ensure we send the join after socket connected (avoid race)
+  if (socket && socket.connected) {
+    socket.emit('join', { roomId, peerId, isHost });
+  } else if (socket) {
+    socket.once('connect', () => socket.emit('join', { roomId, peerId, isHost }));
+  }
 
   startFrameIngest();
   startAudioRecording();
@@ -459,6 +514,13 @@ async function leaveRoom(){
   }
 
   if (localStream) localStream.getTracks().forEach(t => t.stop());
+
+  // flush queued uploads (wait up to 3s) to avoid abrupt client aborts
+  try {
+    await flushAudioQueue(3000);
+  } catch (e) {
+    console.warn("⚠️ flushAudioQueue error:", e);
+  }
 
   socket.emit('leave', { roomId, peerId });
   socket.disconnect();

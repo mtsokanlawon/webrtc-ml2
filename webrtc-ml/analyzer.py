@@ -12,13 +12,14 @@ from assemblyai.streaming.v3 import (
 )
 
 import base64
+import time
 import threading
 import subprocess
 from queue import Queue, Empty
 
-import os, io, re
+import os, io, re, uuid
 import cv2
-import time, math, base64, shutil, subprocess
+import math, base64, shutil, subprocess
 import asyncio, websockets, json
 print(websockets.__version__)
 print(websockets.__file__)
@@ -49,6 +50,7 @@ import seaborn as sns
 import numpy as np
 
 import os
+import requests
 
 # Manage ongoing sessions globally
 sessions = {}
@@ -61,7 +63,7 @@ transcript_logs = defaultdict(list)     # { roomId: [ {text, timestamp} ] }
 analyzer_bp = Blueprint("analyzer", __name__)
 app = Flask(__name__)
 
-ASSEMBLYAI_API_KEY = "433a0641544a46cfab94eb5b44ec4f1f"
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "433a0641544a46cfab94eb5b44ec4f1f")
 
 DATA_ROOT = os.path.join(os.getcwd(), "data")
 os.makedirs(DATA_ROOT, exist_ok=True)
@@ -93,6 +95,7 @@ FATIGUE_YAWN_COOLDOWN_SECONDS = 60
 FATIGUE_BLINK_COUNT = 5
 FATIGUE_BLINK_WINDOW_SECONDS = 10
 FATIGUE_BLINK_COOLDOWN_SECONDS = 10
+
 
 # ===== Utils =====
 def room_peer_dir(room_id, peer_id):
@@ -443,7 +446,10 @@ def generate_meeting_pdf(room_id, transcripts, engagements, summary):
     story.append(Paragraph("<b>Transcript:</b>", styles["Heading2"]))
     if transcripts:
         for t in transcripts:
-            line = f"{t.get('timestamp', '')} ({t.get('speaker', '')}): {t.get('text', '')}"
+            speaker = t.get("peerId") or t.get("speaker") or t.get("peer") or "Unknown"
+            text = t.get("text") or t.get("transcript") or ""
+            timestamp = t.get("timestamp") or t.get("timestamp_iso") or ""
+            line = f"{timestamp} ({speaker}): {text}"
             story.append(Paragraph(line, styles["Normal"]))
     else:
         story.append(Paragraph("No transcript recorded.", styles["Normal"]))
@@ -479,8 +485,37 @@ def generate_meeting_summary(transcripts, engagements):
 
 @app.route("/finalize/<room_id>", methods=["POST"])
 def finalize_room(room_id):
+    # gather engagement events for the room
     engagements = engagement_events.get(room_id, [])
-    transcripts = transcript_logs.get(room_id, [])
+
+    # aggregate transcripts from the room and any per-peer session keys (room_peer)
+    transcripts = []
+    # base room transcripts
+    transcripts.extend(transcript_logs.get(room_id, []))
+
+    # per-peer transcripts (keys like "room_peer")
+    for key, lst in list(transcript_logs.items()):
+        if key != room_id and key.startswith(f"{room_id}_"):
+            transcripts.extend(lst)
+
+    # ALSO include any in-memory transcripts from the live session (not yet persisted)
+    if room_id in sessions:
+        inmem = sessions[room_id].get("transcripts", [])
+        # normalize shape: ensure keys text, peerId, timestamp
+        for it in inmem:
+            transcripts.append({
+                "id": it.get("turn_order") or str(uuid.uuid4()),
+                "peerId": it.get("peerId") or it.get("peer") or it.get("speaker"),
+                "text": it.get("text") or it.get("transcript") or "",
+                "final": it.get("final", False),
+                "timestamp": it.get("timestamp") or datetime.now().strftime("%H:%M:%S"),
+                "timestamp_iso": it.get("timestamp_iso") or datetime.now().isoformat(timespec="milliseconds")
+            })
+
+    # sort by ISO timestamp if present so PDF is chronological
+    def _ts_key(t):
+        return t.get("timestamp_iso") or t.get("timestamp") or ""
+    transcripts.sort(key=_ts_key)
 
     if not engagements and not transcripts:
         return jsonify({"error": "No data recorded"}), 404
@@ -490,14 +525,20 @@ def finalize_room(room_id):
     # Generate PDF
     pdf_path = generate_meeting_pdf(room_id, transcripts, engagements, summary)
 
-    # Cleanup memory after finalizing
+    # Cleanup memory after finalizing: remove room and per-peer entries
     engagement_events.pop(room_id, None)
-    transcript_logs.pop(room_id, None)
+    for key in list(transcript_logs.keys()):
+        if key == room_id or key.startswith(f"{room_id}_"):
+            transcript_logs.pop(key, None)
+
+    # keep sessions intact or optionally stop them; don't assume session removed here
+    # if you want to drop in-memory session data uncomment:
+    # if room_id in sessions: del sessions[room_id]
 
     return jsonify({
         "room": room_id,
         "summary": summary,
-        "download_url": f"/download/{room_id}"  # frontend should call this
+        "download_url": f"/download/{room_id}"
     })
 
 @app.route("/download/<room_id>", methods=["GET"])
@@ -711,18 +752,52 @@ def attach_speech_context(events, transcriptions):
         out.append((ts, ev, desc, prior))
     return out
 
+# async forward queue to avoid blocking AssemblyAI callbacks when posting to Node
+_forward_queue = Queue()
+_requests_session = requests.Session()
+_requests_session.headers.update({"Content-Type": "application/json"})
+
+def _forwarder_loop():
+    while True:
+        try:
+            payload = _forward_queue.get()
+            if payload is None:
+                break
+            try:
+                # short timeout so we don't block for long behind ngrok
+                _requests_session.post("http://localhost:3000/analyze/realtime", json=payload, timeout=2)
+            except Exception as e:
+                # transient failures are OK — log and drop (or requeue if you want retries)
+                print("❌ forward-to-node failed:", getattr(e, "message", str(e)))
+        except Exception as e:
+            print("❌ forwarder loop error:", e)
+
+# start forwarder thread once
+_forward_thread = threading.Thread(target=_forwarder_loop, daemon=True)
+_forward_thread.start()
+
 # ===== Real-Time Transcription API using AssemblyAI =====
 def store_transcript(room_id, text, peer_id=None, ts=None, final=False):
-    if not text.strip():
+    # ignore truly empty / whitespace-only transcripts
+    if not text or not str(text).strip():
         print("⚠️ Ignoring empty transcript")
         return
-    transcript_logs[room_id].append({
+    ts_iso = datetime.now().isoformat(timespec="milliseconds")
+    entry = {
+        "id": str(uuid.uuid4()),
         "peerId": peer_id,
         "text": text.strip(),
         "final": final,
-        "timestamp": ts or datetime.now().strftime("%H:%M:%S")
-    })
-    # print(transcript_logs[room_id])
+        "timestamp": ts or datetime.now().strftime("%H:%M:%S"),
+        "timestamp_iso": ts_iso
+    }
+    
+    # store under the session key only. Do NOT mirror into parent room here:
+    # mirroring caused duplicate reads/emits and extra processing on Node.
+    transcript_logs[room_id].append(entry)
+ 
+    # debug
+    print(f"📝 Stored transcript: {entry['timestamp_iso']} {peer_id}: {entry['text']}")
 
 def start_streaming_session(room_id, api_key):
     """
@@ -746,12 +821,13 @@ def start_streaming_session(room_id, api_key):
         print(f"🔗 Session started for room={room_id}: {event.id}")
 
     def on_turn(client, event: TurnEvent):
-        # ignore empty transcripts
-        if not getattr(event, "transcript", None):
+        # guard: sessions can be removed concurrently (stop_session); avoid KeyError
+        sess = sessions.get(room_id)
+        if sess is None:
+            print(f"⚠️ on_turn received for room {room_id} but session was removed — skipping turn")
             return
-
         # sane defaults
-        peer_id = sessions[room_id].get("last_peer", "Unknown")
+        peer_id = sess.get("last_peer", "Unknown")
 
         # use attributes safely
         turn_order = getattr(event, "turn_order", None)
@@ -779,14 +855,24 @@ def start_streaming_session(room_id, api_key):
 
         # ONLY persist the nicely formatted final (punctuated) into transcript_logs
         # This avoids double writes (raw final + formatted final)
-        if is_final and is_formatted:
+        if is_final:
             # store_transcript accepts peer_id and ts (you already have this signature)
             store_transcript(room_id, event.transcript, peer_id=peer_id, ts=datetime.now().strftime("%H:%M:%S"), final=True)
-            print(f"📝 {room_id} [{peer_id}] stored FINAL (formatted): {event.transcript}")
+            print(f"📝 {room_id} [{peer_id}] stored FINAL: {event.transcript}")
         else:
-            # optionally print interims / raw finals
-            kind = "final" if is_final else "interim"
-            # print(f"📝 {room_id} [{peer_id}] {kind} (formatted={is_formatted}): {event.transcript}")
+            pass
+        # forward every turn (partial or final) to Node so frontend can render in realtime
+        try:
+            parent_room = room_id.split("_", 1)[0] if "_" in room_id else room_id
+            _forward_queue.put({
+                "roomId": parent_room,
+                "peerId": peer_id,
+                "transcript": getattr(event, "transcript", ""),
+                "final": is_final,
+                "ts": datetime.now().isoformat()
+            })
+        except Exception as e:
+            print("❌ Failed to enqueue forward-to-node:", e)
 
     def on_terminated(client, event: TerminationEvent):
         print(f"🔚 Session terminated: {event.audio_duration_seconds} sec processed")
@@ -799,132 +885,316 @@ def start_streaming_session(room_id, api_key):
     client.on(StreamingEvents.Termination, on_terminated)
     client.on(StreamingEvents.Error, on_error)
 
+
+    # Create the session entry BEFORE starting any threads so other callers
+    # (get_or_start_peer_ffmpeg / transcribe_realtime) see a stable structure.
+    sessions[room_id] = {
+        "client": client,
+        "queue": audio_queue,
+        "transcripts": transcripts,
+        "last_peer": "Unknown",
+        "seen_turns": set(),
+        "peers": {},               # map peer_id -> ffmpeg proc
+        "lock": threading.Lock(),  # per-room lock to serialize ffmpeg creation
+        "bytes_received": 0,      # written into ffmpeg stdin (webm bytes)
+        "bytes_enqueued": 0,      # PCM bytes enqueued from ffmpeg stdout
+        "pcm_yields": 0,          # number of yields from generator
+    }
+
+    print(f"🆕 Created streaming session entry for {room_id}")
+    # debug: show API key masked
+    print(f"🔑 Using AssemblyAI key (masked): {api_key[:4]}*** for session {room_id}")
+
     # --- Streaming loop in a background thread ---
     def streaming_loop():
-        client.connect(
-            StreamingParameters(
-                sample_rate=16000,
-                format_turns=True,
+        try:
+            client.connect(
+                StreamingParameters(
+                    sample_rate=AUDIO_SAMPLE_RATE,
+                    format_turns=True,
+                )
             )
-        )
+            print(f"✅ Connected streaming client for session {room_id}")
+        except Exception as e:
+            print("❌ Could not connect streaming client:", e)
+            return
 
         def generator():
+            q = audio_queue
             while True:
-                try:
-                    chunk = audio_queue.get(timeout=1)
-                except Empty:
-                    continue
-                if chunk is None:
+                item = q.get()
+                if item is None:
+                    print(f"🔚 generator received sentinel for session={room_id}")
                     break
-                print(f"Sending chunk of {len(chunk)} bytes")
-                yield chunk
+                # item is now (peer_id, pcm_bytes)
+                if isinstance(item, tuple):
+                    peer_id, pcm_bytes = item
+                    # mark last_peer BEFORE sending bytes so transcripts are attributed
+                    sessions[room_id]["last_peer"] = peer_id
+                    sessions[room_id]["pcm_yields"] += 1
+                    qsize = q.qsize()
+                    print(f"🟢 generator yielding {len(pcm_bytes)} bytes from {peer_id} (session={room_id}) qsize={qsize} yields={sessions[room_id]['pcm_yields']}")
+                    yield pcm_bytes
+                else:
+                    yield item
 
+        # send pcm_bytes to the AssemblyAI streaming client here
+        # (example API, adapt to your streaming client send method)
+        try:
+            client.stream(generator())  # <-- replace with actual send call
+            # client.disconnect(terminate=True)
 
-        client.stream(generator())
-        client.disconnect(terminate=True)
+        except Exception as e:
+            print("❌ Streaming send error:", e)
+        finally:
+            try:
+                client.disconnect(terminate=True)
+            except Exception:
+                pass
+
+        # client.stream(generator())
+        # client.disconnect(terminate=True)
 
     thread = threading.Thread(target=streaming_loop, daemon=True)
     thread.start()
     
-    # Update session storage to include per-peer ffmpeg processes
-    sessions[room_id] = {
-    "client": client,
-    "queue": audio_queue,
-    "transcripts": transcripts,
-    "last_peer": "Unknown",
-    "seen_turns": set(),
-    "peers": {}  # 👈 add a map for per-peer ffmpeg processes
-    }
-
+    # # Update session storage to include per-peer ffmpeg processes
+    # sessions[room_id] = {
+    # "client": client,
+    # "queue": audio_queue,
+    # "transcripts": transcripts,
+    # "last_peer": "Unknown",
+    # "seen_turns": set(),
+    # "peers": {}  # 👈 add a map for per-peer ffmpeg processes
+    # }
 
     return client
 
-# def ensure_peer_ffmpeg(room_id, peer_id):
-#     room = sessions[room_id]
-#     if peer_id not in room["peers"]:
-#         room["peers"][peer_id] = get_or_start_peer_ffmpeg(room_id, peer_id)
-#     return room["peers"][peer_id]
-
 def get_or_start_peer_ffmpeg(room_id, peer_id):
+    """
+    Ensure exactly one ffmpeg process exists per (room,peer).
+    Uses a per-room lock to prevent concurrent spawns.
+    """
+    if room_id not in sessions:
+        raise RuntimeError(f"No active session for room {room_id}")
+
     room = sessions[room_id]
     peers = room["peers"]
+    lock = room.get("lock") or threading.Lock()
 
-    if peer_id in peers and peers[peer_id].poll() is None:
-        return peers[peer_id]  # already running
+    with lock:
+        proc = peers.get(peer_id)
+        if proc and proc.poll() is None:
+            # already running and healthy
+            print(f"ℹ️ Reusing existing ffmpeg for {peer_id} in {room_id}")
+            return proc
 
-    ffmpeg_proc = subprocess.Popen(
-        [
-            "ffmpeg",
-            "-loglevel", "quiet",
-            "-f", "webm",
-            "-i", "pipe:0",
-            "-f", "s16le",
-            "-acodec", "pcm_s16le",
-            "-ar", "16000",
-            "-ac", "1",
-            "pipe:1"
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        # stderr=subprocess.PIPE,
-        bufsize=10**6
-    )
+        # If we have a proc but it's dead, try to clean up
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            peers.pop(peer_id, None)
 
-    # reader thread that pushes PCM into the shared queue
-    def reader():
-        CHUNK_SIZE = 6400
-        buffer = b""
-        print(ffmpeg_proc.stderr.read().decode() if ffmpeg_proc.stderr else "No stderr")
+        # spawn a fresh ffmpeg for this peer
+        print(f"🔧 Spawning ffmpeg for {peer_id} in {room_id}")
+        ffmpeg_proc = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "info",
+                "-fflags", "+genpts",
+                "-thread_queue_size", "512",
+                "-f", "webm",
+                "-i", "pipe:0",
+                "-f", "s16le",
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                "pipe:1"
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=10**6
+        )
 
-        while True:
-            data = ffmpeg_proc.stdout.read(CHUNK_SIZE)
-            if not data:
-                break
-            
-            buffer += data
-            while len(buffer) >= CHUNK_SIZE:
-                chunk, buffer = buffer[:CHUNK_SIZE], buffer[CHUNK_SIZE:]
-                room["queue"].put(chunk)
-                sessions[room_id]["last_peer"] = peer_id  # 👈 track who spoke last
+        # give ffmpeg a moment to fail and surface stderr if it does
+        time.sleep(0.15)  # increase a bit to allow ffmpeg to read header
 
-    threading.Thread(target=reader, daemon=True).start()
+        if ffmpeg_proc.poll() is not None:
+            try:
+                err = ffmpeg_proc.stderr.read().decode("utf-8", errors="replace")
+            except Exception:
+                err = "<could not read ffmpeg stderr>"
+            print(f"❌ ffmpeg for {peer_id} in {room_id} exited immediately: {err.strip()}")
+            raise RuntimeError(f"ffmpeg start failed for {peer_id} in {room_id}: {err.splitlines()[:3]}")
+
+    # start readers bound to this proc + peer so we can enqueue PCM and capture logs
+    threading.Thread(target=reader, args=(ffmpeg_proc, room_id, peer_id), daemon=True).start()
+    threading.Thread(target=stderr_reader, args=(ffmpeg_proc, room_id, peer_id), daemon=True).start()
+
     peers[peer_id] = ffmpeg_proc
     print(f"🚀 Started ffmpeg for peer {peer_id} in room {room_id}")
     return ffmpeg_proc
 
+def reader(proc, room_id, peer_id):
+    """
+    Read raw PCM bytes from ffmpeg stdout and enqueue them as (peer_id, pcm_bytes)
+    into the room's audio queue consumed by the AssemblyAI streaming generator.
+    """
+    try:
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                print(f"⛔ FFmpeg reader EOF for {peer_id} (session={room_id})")
+                break
+            # update diagnostics and enqueue for streaming
+            try:
+                sess = sessions.get(room_id)
+                if not sess or sess.get("stopping"):
+                    print(f"⚠️ Dropping pcm from {peer_id} because session {room_id} is gone/stopping")
+                    break
+                try:
+                    sess["bytes_enqueued"] += len(chunk)
+                except Exception:
+                    pass
+                try:
+                    sess["queue"].put((peer_id, chunk))
+                    print(f"🔊 ffmpeg stdout -> enqueue ({peer_id}) {len(chunk)} bytes (session={room_id})")
+                except Exception as e:
+                    print(f"❌ Failed to enqueue pcm from {peer_id} in {room_id}: {e}")
+                    break
+            except Exception as e:
+                print(f"❌ FFmpeg reader error for {peer_id}: {e}")
+                break
+    except Exception as e:
+        print(f"❌ FFmpeg reader error for {peer_id}: {e}")
+    finally:
+        # cleanup peer proc entry but do NOT stop whole room session
+        try:
+            if proc and proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+        try:
+            sessions[room_id]["peers"].pop(peer_id, None)
+            print(f"🧹 Cleaned up ffmpeg proc for {peer_id} in {room_id}")
+        except Exception:
+            pass
+
+def stderr_reader(proc, room_id, peer_id):
+    """
+    Continuously read ffmpeg stderr lines and log them for debugging.
+    """
+    try:
+        while True:
+            line = proc.stderr.readline()
+            if not line:
+                break
+            try:
+                s = line.decode("utf-8", errors="replace").strip()
+            except Exception:
+                s = "<stderr decode error>"
+            if s:
+                print(f"🧾 ffmpeg[{peer_id}] stderr: {s}")
+    except Exception as e:
+        print(f"❌ ffmpeg stderr reader error for {peer_id}: {e}")
+
 def push_audio_chunk(room_id, chunk_b64, peer_id):
     if room_id not in sessions:
-        print(f"⚠️ No active session for {room_id}")
+        print(f"⚠️ No active session for {room_id} (cannot push audio for {peer_id})")
         return
 
-    proc = get_or_start_peer_ffmpeg(room_id, peer_id)
+    # sanitize common data-URI prefix if present
+    try:
+        # strip possible "data:audio/webm;base64," prefix
+        if isinstance(chunk_b64, str) and chunk_b64.startswith("data:"):
+            chunk_b64 = re.sub(r"^data:[^;]+;base64,", "", chunk_b64)
+        proc = get_or_start_peer_ffmpeg(room_id, peer_id)
+    except Exception as e:
+        print(f"❌ Cannot start ffmpeg for {peer_id} in {room_id}: {e}")
+        return
 
     try:
         chunk = base64.b64decode(chunk_b64)
-        proc.stdin.write(chunk)
-        proc.stdin.flush()
-    except BrokenPipeError:
-        print(f"❌ Broken pipe for peer {peer_id} in room {room_id}")
+        # account bytes received for diagnostics
+        try:
+            sessions[room_id]["bytes_received"] += len(chunk)
+        except Exception:
+            pass
+        # debug
+        print(f"✉️ Writing {len(chunk)} bytes to ffmpeg stdin for {peer_id} @ {room_id} (total_received={sessions[room_id].get('bytes_received',0)})")
+        try:
+            proc.stdin.write(chunk)
+            proc.stdin.flush()
+        except (BrokenPipeError, ValueError) as e:
+            # ffmpeg died / pipe invalid — try to restart ffmpeg once and retry the write
+            print(f"❌ Broken pipe / invalid stdin for {peer_id} in {room_id}: {e}. Restarting ffmpeg and retrying chunk...")
+            try:
+                # cleanup stale proc if any
+                try:
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                except Exception:
+                    pass
+                sessions[room_id]["peers"].pop(peer_id, None)
+                # start a fresh ffmpeg and attempt write one more time
+                proc2 = get_or_start_peer_ffmpeg(room_id, peer_id)
+                proc2.stdin.write(chunk)
+                proc2.stdin.flush()
+            except Exception as e2:
+                print(f"❌ Retry write failed for {peer_id} in {room_id}: {e2}")
+                try:
+                    proc2.terminate()
+                except Exception:
+                    pass
+                sessions[room_id]["peers"].pop(peer_id, None)
     except Exception as e:
-        print(f"❌ Error writing to ffmpeg for peer {peer_id}: {e}")
-
+        print(f"❌ Error writing to ffmpeg for peer {peer_id} in room {room_id}: {e}")
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        sessions[room_id]["peers"].pop(peer_id, None)
 
 def stop_session(room_id):
     """
     Stop session gracefully.
     """
-    if room_id in sessions:
-        # stop the streaming loop
-        sessions[room_id]["queue"].put(None)
+    if room_id not in sessions:
+        return
 
-        # terminate all peer ffmpeg procs
-        for peer_id, proc in sessions[room_id].get("peers", {}).items():
+    # mark stopping so readers/generator know not to re-create stuff
+    sessions[room_id]["stopping"] = True
+
+    # signal generator to finish
+    try:
+        sessions[room_id]["queue"].put(None)
+    except Exception:
+        pass
+
+    # terminate peer ffmpeg procs
+    for peer_id, proc in list(sessions[room_id].get("peers", {}).items()):
+        try:
             if proc and proc.poll() is None:
                 proc.terminate()
                 print(f"🛑 Killed ffmpeg for peer {peer_id} in room {room_id}")
+        except Exception as e:
+            print(f"❌ Error terminating ffmpeg for {peer_id}: {e}")
+        sessions[room_id]["peers"].pop(peer_id, None)
 
-        del sessions[room_id]
-        print(f"🛑 Session stopped for room {room_id}")
+    # remove session entry a little later to let AssemblyAI callback threads finish cleanly
+    def _del():
+        try:
+            sessions.pop(room_id, None)
+            print(f"🛑 Session stopped for room {room_id}")
+        except Exception:
+            pass
+
+    # schedule deletion after 1s (adjust as needed); safe because on_turn now checks sessions.get()
+    threading.Timer(1.0, _del).start()
 
 @app.route("/start_session/<room_id>", methods=["POST"])
 def start_session(room_id):
@@ -933,29 +1203,54 @@ def start_session(room_id):
     start_streaming_session(room_id, ASSEMBLYAI_API_KEY)
     return jsonify({"status": "started", "room": room_id})
 
+# def transcribe_realtime(room_id):
+#     data = request.json
+#     chunk_b64 = data.get("audio")
+#     peer_id = data.get("peerId", "unknown")  # ✅ receive peerId from Node
+
+#     if not chunk_b64 or not peer_id:
+#         return jsonify({"error": "missing audio or peerId"}), 400
+    
+#     # Save peer for this room
+#     if room_id not in sessions:
+#         return jsonify({"error": f"Session {room_id} not active"}), 400
+    
+#     sessions[room_id]["last_peer"] = peer_id
+
+#     push_audio_chunk(room_id, chunk_b64, peer_id)  # pass along peerId
+#     return jsonify({"status": "ok"})
+
 @app.route("/transcribe/realtime/<room_id>", methods=["POST"])
 def transcribe_realtime(room_id):
     data = request.json
     chunk_b64 = data.get("audio")
-    peer_id = data.get("peerId", "unknown")  # ✅ receive peerId from Node
+    peer_id = data.get("peerId", "unknown")
+
+    # debug tracing
+    print(f"🔔 /transcribe/realtime called for room={room_id} peerId={peer_id} size={len(chunk_b64) if chunk_b64 else 0}")
 
     if not chunk_b64 or not peer_id:
         return jsonify({"error": "missing audio or peerId"}), 400
-    
-    # Save peer for this room
+
+    # Ensure a single room-level session exists (do not create a separate AssemblyAI client per peer)
     if room_id not in sessions:
-        return jsonify({"error": f"Session {room_id} not active"}), 400
-    
+        print(f"ℹ️ Starting room streaming session: {room_id}")
+        start_streaming_session(room_id, ASSEMBLYAI_API_KEY)
+
+    # mark last_peer so the room session can attribute turns while generator consumes tagged tuples
     sessions[room_id]["last_peer"] = peer_id
 
-    push_audio_chunk(room_id, chunk_b64, peer_id)  # pass along peerId
+    # push into the room session (get_or_start_peer_ffmpeg will spawn per-peer ffmpeg under room)
+    push_audio_chunk(room_id, chunk_b64, peer_id)
+
     return jsonify({"status": "ok"})
 
 @app.route("/get_transcripts/<room_id>", methods=["GET"])
 def get_transcripts(room_id):
-    if room_id not in sessions:
-        return jsonify({"error": "no session"}), 404
+    # if room_id not in sessions:
+    #     return jsonify({"error": "no session"}), 404
 
+    # return any transcripts we have for the room (don't require an active session)
     transcripts = transcript_logs.get(room_id, [])
     print(f"Returning {len(transcripts)} transcripts for room {room_id}")
     return jsonify({"transcripts": transcripts})

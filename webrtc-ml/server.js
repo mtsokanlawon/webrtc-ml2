@@ -12,8 +12,57 @@ const ffmpegSessions = {}; // key: roomId+peerId → ffmpeg process
 const sessions = {};
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
-const upload = multer();
+// const io = new Server(server);
+const io = new Server(server, {
+  transports: ["websocket"], // prefer websockets (avoid polling over ngrok)
+  pingInterval: 20000,
+  pingTimeout: 5000,
+  cors: { origin: "*" }
+});
+const upload = multer({ limits: { fileSize: 6 * 1024 * 1024 } }); // 6 MB max chunks
+
+// simple in-memory transcript store (room and per-room_peer)
+const transcripts = {}; // key -> [{ peerId, transcript, final, ts }]
+
+// parse JSON from analyzer
+app.use(express.json({ limit: '1mb' }));
+
+// analyzer -> Node: store transcript and notify clients
+app.post('/analyze/realtime', (req, res) => {
+  const { roomId, peerId, transcript, final, ts } = req.body || {};
+  if (!roomId || !peerId || typeof transcript !== 'string') {
+    return res.status(400).json({ error: 'roomId, peerId and transcript required' });
+  }
+
+  const roomKey = roomId;
+  const peerKey = `${roomId}_${peerId}`;
+  const entry = {
+    peerId,
+    transcript,
+    final: !!final,
+    ts: ts || new Date().toISOString(),
+  };
+
+  transcripts[roomKey] = transcripts[roomKey] || [];
+  transcripts[peerKey] = transcripts[peerKey] || [];
+  transcripts[roomKey].push(entry);
+  transcripts[peerKey].push(entry);
+
+  // notify connected clients in the room immediately
+  try {
+    emitToRoom(roomId, 'transcript', { roomId, ...entry });
+  } catch (err) {
+    console.warn('emit transcript error', err && err.message);
+  }
+
+  return res.json({ ok: true });
+});
+
+// existing frontend polling endpoint (or add if missing)
+app.get('/get_transcripts/:room', (req, res) => {
+  const key = req.params.room;
+  return res.json(transcripts[key] || []);
+});
 
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json({ limit: "50mb" }));
@@ -35,6 +84,29 @@ function stopFFmpeg(sessionKey) {
     }
 
     delete ffmpegSessions[sessionKey];
+}
+
+// helper: stop every per-peer session for a room (ffmpeg + python session)
+function stopAllRoomSessions(roomId) {
+    // stop ffmpeg sessions whose key starts with `${roomId}_`
+    for (const key of Object.keys(ffmpegSessions)) {
+        if (key.startsWith(`${roomId}_`)) {
+            try {
+                stopFFmpeg(key);
+                console.log(`🛑 Stopped ffmpeg session ${key}`);
+            } catch (err) {
+                console.error(`❌ Error stopping ffmpeg ${key}:`, err.message);
+            }
+            axios.post(`http://localhost:5000/stop_session/${key}`)
+              .then(() => console.log(`🛑 Notified Python to stop session ${key}`))
+              .catch(err => console.error(`❌ Failed to stop python session ${key}:`, err.message));
+        }
+    }
+
+    // defensive: also request a room-level stop (compat fallback)
+    axios.post(`http://localhost:5000/stop_session/${roomId}`)
+      .then(() => console.log(`🛑 Notified Python to stop room session ${roomId}`))
+      .catch(() => { /* ignore if endpoint not used */ });
 }
 
 // ========== Ingest Frame, Analyze Real-Time ==========
@@ -83,29 +155,43 @@ app.post("/ingest/frame", async (req, res) => {
 // ========== Ingest Audio ==========
 app.post("/ingest/audio", upload.single("file"), async (req, res) => {
   const { roomId, peerId, timestamp } = req.body;
+  // detect client aborts early (prevents raw-body noisy stack traces)
+  req.on && req.on("aborted", () => {
+    console.warn(`⚠️ Upload aborted by client for room=${roomId} peer=${peerId}`);
+  });
+
   if (!roomId || !peerId || !req.file) {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  // ensure audio dir exists (optional, only if you still want raw saving)
-  const dir = path.join(__dirname, "data", roomId, peerId, "audio");
-  fs.mkdirSync(dir, { recursive: true });
+  try {
+    // ensure audio dir exists (optional, only if you still want raw saving)
+    const dir = path.join(__dirname, "data", roomId, peerId, "audio");
+    fs.mkdirSync(dir, { recursive: true });
 
-  // save raw .webm chunk (optional for debugging)
-  const webmPath = path.join(dir, `audio_${timestamp}.webm`);
-  fs.writeFileSync(webmPath, req.file.buffer);
-  console.log(`🎙️ Saved raw audio: ${webmPath}`);
+    // save raw .webm chunk (optional for debugging)
+    const webmPath = path.join(dir, `audio_${timestamp}.webm`);
+    fs.writeFileSync(webmPath, req.file.buffer);
+    console.log(`🎙️ Saved raw audio: ${webmPath}`);
 
-  // instead of writing into ffmpeg stdin:
-  const chunkB64 = req.file.buffer.toString("base64");
+    // send to Python (defensive: timeout + swallow network errors)
+    const chunkB64 = req.file.buffer.toString("base64");
+    try {
+      await axios.post(`http://localhost:5000/transcribe/realtime/${roomId}`, {
+        audio: chunkB64,
+        peerId: peerId,
+      }, { timeout: 10_000 });
+    } catch (err) {
+      console.error("❌ Real-time transcription proxy error:", err.message);
+    }
 
-  await axios.post(`http://localhost:5000/transcribe/realtime/${roomId}`, {
-    audio: chunkB64,
-    peerId: peerId,
-  }).catch(err => console.error("❌ Real-time transcription error", err.message));
-
-  res.json({ status: "ok" });
-  
+    res.json({ status: "ok" });
+  } catch (e) {
+    console.error("❌ Ingest audio handler error:", e && e.message ? e.message : e);
+    // if the client aborted mid-upload, respond gracefully
+    if (res.headersSent) return;
+    res.status(500).json({ error: "Audio ingest failed" });
+  }
 });
 
 // Finalize and auto-download report
@@ -142,6 +228,29 @@ io.on("connection", (socket) => {
     socket.join(roomId);
     socket.roomId = roomId;
     socket.peerId = peerId;
+    // send recent transcripts to the newly joined socket so they catch up
+    (async () => {
+      try {
+        const peerIds = rooms[roomId] ? [...rooms[roomId]] : [];
+        const sessionKeys = [roomId, ...peerIds.map(p => `${roomId}_${p}`)];
+        const all = [];
+        for (const sk of sessionKeys) {
+          try {
+            const r = await axios.get(`http://localhost:5000/get_transcripts/${sk}`, { timeout: 3000 });
+            const ts = r.data.transcripts || [];
+            all.push(...ts);
+          } catch (e) {
+            // ignore per-session fetch failures
+          }
+        }
+        if (all.length) {
+          // emit only to the joining socket so it gets history immediately
+          socket.emit('transcription-event', { transcripts: all, sessionKey: roomId });
+        }
+      } catch (e) {
+        console.warn('Failed to fetch transcripts for join:', e && e.message);
+      }
+    })();
 
     if (!rooms[roomId]) rooms[roomId] = new Set();
     rooms[roomId].add(peerId);
@@ -198,12 +307,14 @@ io.on("connection", (socket) => {
         delete rooms[roomId];
         delete hosts[roomId];
 
-        // Stop AssemblyAI session
-        axios.post(`http://localhost:5000/stop_session/${roomId}`)
-          .then(() => console.log(`🛑 Session stopped for ${roomId}`))
-          .catch(err => console.error("❌ Failed to stop session:", err.message));
-      const sessionKey = `${roomId}_${peerId}`;
-      stopFFmpeg(sessionKey);
+    //     // Stop AssemblyAI session
+    //     axios.post(`http://localhost:5000/stop_session/${roomId}`)
+    //       .then(() => console.log(`🛑 Session stopped for ${roomId}`))
+    //       .catch(err => console.error("❌ Failed to stop session:", err.message));
+    // const sessionKey = `${roomId}_${peerId}`;
+    // stopFFmpeg(sessionKey);
+        // stop all per-peer sessions for this room
+        stopAllRoomSessions(roomId);
       } else if (hosts[roomId] === peerId) {
         // Reassign host
         hosts[roomId] = [...rooms[roomId]][0];
@@ -227,13 +338,15 @@ io.on("connection", (socket) => {
         delete rooms[roomId];
         delete hosts[roomId];
 
-        // Stop AssemblyAI session
-        axios.post(`http://localhost:5000/stop_session/${roomId}`)
-          .then(() => console.log(`🛑 Session stopped for ${roomId}`))
-          .catch(err => console.error("❌ Failed to stop session:", err.message));
+      //   // Stop AssemblyAI session
+      //   axios.post(`http://localhost:5000/stop_session/${roomId}`)
+      //     .then(() => console.log(`🛑 Session stopped for ${roomId}`))
+      //     .catch(err => console.error("❌ Failed to stop session:", err.message));
 
-      const sessionKey = `${roomId}_${peerId}`;
-      stopFFmpeg(sessionKey);
+      // const sessionKey = `${roomId}_${peerId}`;
+      // stopFFmpeg(sessionKey);
+        // stop all per-peer sessions for this room
+        stopAllRoomSessions(roomId);
       } else if (hosts[roomId] === peerId) {
         hosts[roomId] = [...rooms[roomId]][0];
       }
@@ -249,57 +362,54 @@ io.on("connection", (socket) => {
 });
 
 // ========== Poll Transcripts & Emit to all Users ==========
-// Track sent transcripts per room
-const sentTranscripts = {}; // { roomId: Set<string> }
+// Track sent transcripts per sessionKey (room or room_peer)
+const sentTranscripts = {}; // { sessionKey: Set<string> }
 
+// Poll faster and emit individual events to reduce client processing time
 setInterval(async () => {
   for (const roomId of Object.keys(rooms)) {
-    try {
-      const res = await axios.get(`http://localhost:5000/get_transcripts/${roomId}`);
-      const transcripts = res.data.transcripts || [];
-
-      // console.log("📦 Raw transcripts:", JSON.stringify(res.data.transcripts, null, 2));
-
-      if (!sentTranscripts[roomId]) {
-        sentTranscripts[roomId] = new Set();
+    const peerIds = [...rooms[roomId]];
+    const sessionKeys = [roomId, ...peerIds.map(p => `${roomId}_${p}`)];
+    for (const sessionKey of sessionKeys) {
+      try {
+        const res = await axios.get(`http://localhost:5000/get_transcripts/${sessionKey}`, { timeout: 3000 });
+        const transcripts = res.data.transcripts || [];
+        if (!sentTranscripts[sessionKey]) sentTranscripts[sessionKey] = new Set();
+        for (const t of transcripts) {
+          const key = t.id || t.timestamp_iso || `${t.timestamp}-${t.peerId}-${t.text}`;
+          if (sentTranscripts[sessionKey].has(key)) continue;
+          sentTranscripts[sessionKey].add(key);
+          // emit a single lightweight event per transcript (clients append incrementally)
+          emitToRoom(roomId, "transcript", { roomId, ...t });
+        }
+      } catch (err) {
+        console.error("❌ Transcript fetch failed for", sessionKey, err.message);
       }
-
-      // Only pick up new finalized transcripts
-      const newOnes = transcripts.filter(t => {
-        const key = `${t.timestamp}-${t.peerId}-${t.text}`;
-        if (sentTranscripts[roomId].has(key)) return false;
-        sentTranscripts[roomId].add(key);
-        return true;
-      });
-
-      if (newOnes.length > 0) {
-        // Format each transcript on its own line
-        const joinedText = newOnes
-          .map(t => `[${t.timestamp}] (${t.peerId || "Unknown"}): ${t.text.trim()}`)
-          .join("\n");
-
-        console.log(`📝 Sent:\n${joinedText}\n➡️ to users in room ${roomId}`);
-
-        // Emit to all users
-        io.to(roomId).emit("transcription-event", { transcripts: joinedText });
-
-        // // if (hostPeerId) {
-        //   for (let [sid, s] of io.of("/").sockets) {
-        //     if (s.roomId === roomId)// && s.peerId === hostPeerId) 
-        //     {
-        //       // Send as plain string
-        //       s.emit("transcription-event", { transcripts: joinedText} );
-        //     }
-        //   }
-        // }
-      }
-    } catch (err) {
-      console.error("❌ Transcript fetch failed for room", roomId, err.message);
     }
   }
-}, 2000);
-
+}, 500);
 
 // ========== Start Server ==========
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));
+
+// global express error handler to catch raw-body / parse errors
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  console.error("❌ Express error:", err && err.message ? err.message : err);
+  if (res.headersSent) return next(err);
+  res.status(err.status || 400).json({ error: err.message || "Bad request" });
+});
+
+// helper: emit to room with debug info
+const lastEmitTs = new Map();
+function emitToRoom(room, event, payload) {
+  const now = Date.now();
+  const prev = lastEmitTs.get(room) || now;
+  const delta = now - prev;
+  lastEmitTs.set(room, now);
+  const sockets = io.sockets.adapter.rooms.get(room);
+  const size = sockets ? sockets.size : 0;
+  console.log(`EMIT -> ${event} to room=${room} sockets=${size} delta_ms=${delta} payloadSize=${JSON.stringify(payload).length}`);
+  io.to(room).emit(event, payload);
+}
