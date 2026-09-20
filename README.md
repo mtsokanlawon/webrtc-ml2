@@ -97,4 +97,4 @@ It laid the groundwork for my continued exploration of:
 **Status:** Experimental / Prototype
 
 ## License
-MIT [License](wrbrtc-ml/LICENSE)
+MIT [License](LICENSE)
